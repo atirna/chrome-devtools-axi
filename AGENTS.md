@@ -50,6 +50,9 @@ Teardown is careful about orphans: the bridge kills its own process group on exi
 `resolveTransportSpec` (`src/bridge.ts`) picks how chrome-devtools-mcp is spawned: explicit `CHROME_DEVTOOLS_AXI_MCP_PATH`, else an auto-detected global npm install (fast), else `npx -y chrome-devtools-mcp@latest` (slow first run).
 Connection modes are env-driven (`buildTransportArgs`): `AUTO_CONNECT` (Chrome 144+ remote debugging), `BROWSER_URL` (http(s) -> `--browserUrl`, ws(s) -> `--wsEndpoint` + `WS_HEADERS`), `USER_DATA_DIR` (persistent profile) vs the default `--isolated`, `CHANNEL` (`--channel` to pick which installed Chrome release channel is attached to or launched, omitted in `BROWSER_URL`/`wsEndpoint` mode), and `HEADED`.
 
+The launch modes (`--isolated`/`--userDataDir`) pass `KEYCHAIN_ISOLATION_CHROME_ARGS` so browsers we start cannot reach the machine owner's password store; attach modes deliberately omit them because that browser's keychain policy belongs to whoever started it.
+`test/keychain-isolation.test.ts` owns the regression rationale and structural invariant; README.md documents the user-facing behavior.
+
 Named sessions (`CHROME_DEVTOOLS_AXI_SESSION`, `src/sessions.ts`) give each name its own bridge - its own port (explicit `CHROME_DEVTOOLS_AXI_PORT`, else a deterministic FNV-1a hash of the name) and its own state dir under `~/.chrome-devtools-axi/sessions/<name>/` (PID file + generation counter) - so concurrent sessions don't share a bridge or each other's stale-ref tracking.
 The default (unset) session keeps port 9224 and the legacy `~/.chrome-devtools-axi/` paths, so existing behavior is unchanged.
 `resolveSessionName` validates the name (rejecting path-traversal/unsafe and all-dot names) and is the single chokepoint every entry point resolves through; a session isolates only the bridge, so the connection mode and profile compose unchanged.
