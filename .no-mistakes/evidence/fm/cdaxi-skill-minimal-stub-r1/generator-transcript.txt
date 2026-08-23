@@ -1,0 +1,7 @@
+$ pnpm run build:skill
+$ tsx scripts/build-skill.ts
+Wrote /Users/kunchen/.no-mistakes/worktrees/fdb54d0fcf83/01M0RFY81QWNMQ00Z3QZEG4JDJ/skills/chrome-devtools-axi/SKILL.md
+
+$ pnpm run build:skill -- --check
+$ tsx scripts/build-skill.ts -- --check
+skills/chrome-devtools-axi/SKILL.md is up to date.

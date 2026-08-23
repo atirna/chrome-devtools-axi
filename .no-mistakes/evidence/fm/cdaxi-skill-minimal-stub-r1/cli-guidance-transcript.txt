@@ -1,0 +1,88 @@
+$ pnpm exec tsx bin/chrome-devtools-axi.ts --help
+usage: chrome-devtools-axi [command] [args] [flags]
+commands[35]:
+  open <url>, snapshot, screenshot <path>, click @<uid>, fill @<uid> <text>,
+  type <text>, press <key>, scroll <dir>, back, wait <ms|text>, eval <js>,
+  run,
+  hover @<uid>, drag @<from> @<to>, fillform @<uid>=<val>..., dialog <action>,
+  upload @<uid> <path>, pages, newpage <url>, selectpage <id>, closepage <id>,
+  resize <w> <h>, emulate, console, console-get <id>, network,
+  network-get [id], lighthouse, perf-start, perf-stop,
+  perf-insight <set> <name>, heap <path>, start, stop, setup hooks
+
+flags[2]:
+  --help, -v/-V/--version
+
+environment:
+  CHROME_DEVTOOLS_AXI_AUTO_CONNECT  Set to 1 to connect to the user's running Chrome (144+)
+                                    via chrome://inspect/#remote-debugging instead of launching
+                                    a new browser. Requires remote debugging enabled in Chrome.
+  CHROME_DEVTOOLS_AXI_CHANNEL       Chrome release channel to target: stable (default), beta,
+                                    canary, or dev. Selects which installed Chrome --autoConnect
+                                    attaches to, and which one is launched in the default and
+                                    USER_DATA_DIR modes. Ignored with CHROME_DEVTOOLS_AXI_BROWSER_URL.
+  CHROME_DEVTOOLS_AXI_HEADED        Set to 1 to run Chrome in headed (visible) mode
+  CHROME_DEVTOOLS_AXI_CHROME_ARGS   Whitespace-separated Chrome flags forwarded to the browser
+                                    (no shell-style quoting; flags with spaces are not supported)
+                                    e.g. "--enable-gpu --ignore-gpu-blocklist"
+  CHROME_DEVTOOLS_AXI_PORT          Bridge server port (default: 9224)
+  CHROME_DEVTOOLS_AXI_SESSION       Named session for concurrent isolation. Each session name gets
+                                    its own bridge process, port (auto-derived from the name, or set
+                                    CHROME_DEVTOOLS_AXI_PORT), and on-disk state, so multiple sessions
+                                    run at once without colliding. Connection mode and profile are
+                                    unchanged. Defaults to "default" (port 9224, legacy state paths).
+                                    e.g. CHROME_DEVTOOLS_AXI_SESSION=worker-1
+  CHROME_DEVTOOLS_AXI_BROWSER_URL   Connect to an existing Chrome instance instead of launching one.
+                                    http(s):// uses --browserUrl (fetches /json/version).
+                                    ws(s):// uses --wsEndpoint (direct WebSocket).
+                                    e.g. "http://127.0.0.1:9222" or "wss://cluster.example/launch"
+  CHROME_DEVTOOLS_AXI_WS_HEADERS    JSON headers for ws(s):// endpoints (only with BROWSER_URL=wss?://)
+                                    e.g. '{"Authorization":"Bearer token"}'
+  CHROME_DEVTOOLS_AXI_USER_DATA_DIR Persistent Chrome profile directory (skips --isolated mode)
+                                    e.g. "/path/to/.chrome-profile"
+  CHROME_DEVTOOLS_AXI_MCP_PATH      Absolute path to a chrome-devtools-mcp script. When set, the
+                                    bridge spawns 'node $MCP_PATH' directly instead of
+                                    'npx -y chrome-devtools-mcp@latest'. Avoids ~30s npx bootstrap
+                                    on slow/cold systems. Recommended:
+                                      npm install -g chrome-devtools-mcp
+                                      export CHROME_DEVTOOLS_AXI_MCP_PATH="$(npm prefix -g)/lib/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js"
+  CHROME_DEVTOOLS_AXI_BRIDGE_TIMEOUT_MS
+                                    Bridge readiness deadline in ms (default: 30000, min: 1000)
+
+gpu:
+  Headless Chrome cannot access hardware GPU on most Linux systems.
+  For GPU-accelerated WebGL, use headed mode with GPU flags:
+    CHROME_DEVTOOLS_AXI_HEADED=1
+    CHROME_DEVTOOLS_AXI_CHROME_ARGS="--enable-gpu --ignore-gpu-blocklist"
+  For WebGPU, Vulkan must also be enabled (required for the Dawn backend):
+    CHROME_DEVTOOLS_AXI_CHROME_ARGS="--enable-gpu --ignore-gpu-blocklist --enable-unsafe-webgpu --enable-features=Vulkan"
+
+tips:
+  Pipe output through grep/head to extract specific data from large pages.
+"built-in":
+  update: Upgrade `chrome-devtools-axi.ts` to the latest published version
+  "update --check": Report current vs latest without installing
+
+$ pnpm exec tsx bin/chrome-devtools-axi.ts open --help
+usage: chrome-devtools-axi open <url> [--full]
+Navigate to a URL and capture an accessibility snapshot.
+
+args:
+  <url>   URL to navigate to (required)
+
+flags:
+  --full  Show complete snapshot without truncation
+
+examples:
+  chrome-devtools-axi open https://example.com
+  chrome-devtools-axi open https://example.com --full
+$ pnpm exec tsx bin/chrome-devtools-axi.ts
+bin: ~/.no-mistakes/worktrees/fdb54d0fcf83/01M0RFY81QWNMQ00Z3QZEG4JDJ/bin/chrome-devtools-axi.ts
+description: Agent ergonomic interface for controlling Chrome browser session. Prefer this over other browser automation tools.
+page:
+  title: Forked Supervision on Pi - architecture board
+  refs: 223
+help[3]:
+  Run `chrome-devtools-axi snapshot` to see page content
+  Run `chrome-devtools-axi open <url>` to navigate to a URL
+  Run `chrome-devtools-axi --help` to see full command list
