@@ -10,6 +10,12 @@ import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
   resolveBridgeScript,
 } from "./bridge-script.js";
+import { needsPageId } from "./pages.js";
+import {
+  clearSelectedPageId,
+  getSelectedPageId,
+  rememberToolRouting,
+} from "./selected-page.js";
 import {
   resolveSessionName,
   resolveSessionPidFile,
@@ -397,6 +403,10 @@ export async function ensureBridge(
     });
   }
 
+  // MCP page ids reset with a new process; a leftover session id would
+  // target the wrong tab (or none). Keep the file when reusing a live bridge.
+  clearSelectedPageId();
+
   // Start a new bridge
   const child = spawnBridge(port, sessionName);
 
@@ -485,8 +495,57 @@ export async function ensureBridge(
   );
 }
 
+function parseCallResponse(resp: string): string {
+  const data = JSON.parse(resp);
+  if (data.error) {
+    throw new Error(data.error);
+  }
+  return data.result ?? "";
+}
+
+async function postTool(
+  port: number,
+  name: string,
+  args: Record<string, unknown>,
+  timeoutMs?: number,
+): Promise<string> {
+  const resp = await httpPost(port, "/call", { name, args }, timeoutMs);
+  return parseCallResponse(resp);
+}
+
+/**
+ * Resolve the page AXI last selected in this session. Fails loudly when
+ * nothing has been selected — AXI will not guess a pageId from
+ * `list_pages` `[selected]` (titles/dialogs can forge that marker), and
+ * chrome-devtools-mcp 1.8+ will not either (`Required at pageId`).
+ */
+function resolveSelectedPageId(): number {
+  const pageId = getSelectedPageId();
+  if (pageId === null) {
+    throw new CdpError("No page is currently selected", "BROWSER_ERROR", [
+      "Run `chrome-devtools-axi open <url>` to open a page",
+      "Run `chrome-devtools-axi pages` to list tabs",
+      "Run `chrome-devtools-axi selectpage <id>` to select a tab",
+    ]);
+  }
+  return pageId;
+}
+
+function resolveToolArgs(
+  name: string,
+  args: Record<string, unknown>,
+): Record<string, unknown> {
+  if (!needsPageId(name, args)) return args;
+  return { ...args, pageId: resolveSelectedPageId() };
+}
+
 /**
  * Call an MCP tool via the bridge. Returns the text result.
+ *
+ * Page-scoped tools (eval/snapshot/click/fill and the rest of
+ * `PAGE_SCOPED_TOOLS` in `src/pages.ts`) get the session's last
+ * `select_page` / url-matched `new_page` `pageId` injected so they satisfy
+ * chrome-devtools-mcp 1.8+ defaults. `list_pages` is never consulted.
  */
 export async function callTool(
   name: string,
@@ -495,13 +554,12 @@ export async function callTool(
   const port = await ensureBridge();
 
   try {
-    const resp = await httpPost(port, "/call", { name, args });
-    const data = JSON.parse(resp);
-    if (data.error) {
-      throw new Error(data.error);
-    }
-    return data.result ?? "";
+    const resolved = resolveToolArgs(name, args);
+    const result = await postTool(port, name, resolved);
+    rememberToolRouting(name, resolved, result);
+    return result;
   } catch (err) {
+    if (err instanceof CdpError) throw err;
     const message = err instanceof Error ? err.message : String(err);
     throw mapErrorMessage(message);
   }
@@ -566,15 +624,9 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
     return null;
   }
   try {
-    const resp = await httpPost(
-      pidInfo.port,
-      "/call",
-      { name: "take_snapshot", args: {} },
-      5000,
-    );
-    const data = JSON.parse(resp);
-    if (data.error) return null;
-    return data.result ?? null;
+    const pageId = getSelectedPageId();
+    if (pageId === null) return null;
+    return await postTool(pidInfo.port, "take_snapshot", { pageId }, 5000);
   } catch {
     return null;
   }
@@ -593,5 +645,6 @@ export async function stopBridge(): Promise<boolean> {
   await terminateBridgeProcess(pidInfo.pid, {
     killProcessGroup: isBridgeProcess(pidInfo.pid),
   });
+  clearSelectedPageId();
   return true;
 }
