@@ -15,6 +15,7 @@
 
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+import { ListRootsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { execSync } from "node:child_process";
 import {
   createServer,
@@ -29,7 +30,8 @@ import {
   unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve } from "node:path";
+import { pathToFileURL } from "node:url";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
   resolveBridgeScript,
@@ -52,6 +54,13 @@ export interface BridgeContentBlock {
 export interface BridgeCallPayload {
   name: string;
   args: Record<string, unknown>;
+  /**
+   * Absolute directories the caller wants added to the MCP workspace roots for
+   * this call, so file-writing tools may write there. See
+   * {@link RootsAwareClient.applyRoots} and the roots negotiation in
+   * `runBridge`.
+   */
+  roots?: string[];
 }
 
 interface BridgeToolDescription {
@@ -61,11 +70,26 @@ interface BridgeToolDescription {
 
 export interface BridgeClient {
   listTools(): Promise<{ tools: BridgeToolDescription[] }>;
-  callTool(request: {
-    name: string;
-    arguments: Record<string, unknown>;
-  }): Promise<unknown>;
+  callTool(
+    request: {
+      name: string;
+      arguments: Record<string, unknown>;
+    },
+    roots?: string[],
+  ): Promise<unknown>;
   close(): Promise<void>;
+  /**
+   * Negotiate the MCP workspace roots to the given absolute directories before
+   * the next tool call, so a caller-supplied write path outside the OS temp
+   * directory passes chrome-devtools-mcp's `validatePath`. Optional so test
+   * fakes need not implement it; the real client always does.
+   */
+  applyRoots?(dirs: string[]): Promise<void>;
+}
+
+/** A {@link BridgeClient} that always negotiates MCP roots. */
+export interface RootsAwareClient extends BridgeClient {
+  applyRoots(dirs: string[]): Promise<void>;
 }
 
 export async function isBridgeClientConnected(
@@ -247,18 +271,40 @@ function getToolContent(result: unknown): BridgeContentBlock[] {
   return result.content as BridgeContentBlock[];
 }
 
+/**
+ * Whether an MCP tool result signals failure (`isError: true`). chrome-devtools-mcp
+ * reports recoverable tool failures - a denied file write, a bad selector, a
+ * navigation error - as a *successful* JSON-RPC response carrying `isError`, not
+ * as a protocol error. Treating that as success is how a rejected screenshot got
+ * reported as written (issue #96); the bridge must surface it as a failure so the
+ * CLI exits non-zero with the tool's own message.
+ */
+export function isToolResultError(result: unknown): boolean {
+  return (
+    !!result &&
+    typeof result === "object" &&
+    "isError" in result &&
+    (result as { isError?: unknown }).isError === true
+  );
+}
+
 export function parseBridgeCallPayload(body: string): BridgeCallPayload {
-  let payload: { name?: unknown; args?: unknown };
+  let payload: { name?: unknown; args?: unknown; roots?: unknown };
   try {
-    payload = JSON.parse(body) as { name?: unknown; args?: unknown };
+    payload = JSON.parse(body) as {
+      name?: unknown;
+      args?: unknown;
+      roots?: unknown;
+    };
   } catch {
     throw new Error("Invalid bridge request payload");
   }
   if (typeof payload.name !== "string" || payload.name.length === 0) {
     throw new Error("Invalid bridge request payload");
   }
+  const roots = parseRootsField(payload.roots);
   if (payload.args === undefined) {
-    return { name: payload.name, args: {} };
+    return { name: payload.name, args: {}, ...(roots ? { roots } : {}) };
   }
   if (
     payload.args === null ||
@@ -267,7 +313,28 @@ export function parseBridgeCallPayload(body: string): BridgeCallPayload {
   ) {
     throw new Error("Invalid bridge request payload");
   }
-  return { name: payload.name, args: payload.args as Record<string, unknown> };
+  return {
+    name: payload.name,
+    args: payload.args as Record<string, unknown>,
+    ...(roots ? { roots } : {}),
+  };
+}
+
+/**
+ * Validate the optional `roots` field: absent, or an array of absolute
+ * directory paths. Any other shape is a malformed payload and is rejected
+ * loudly rather than silently dropped, so a client bug can't quietly disable
+ * roots negotiation or make roots depend on the bridge process's cwd.
+ */
+function parseRootsField(roots: unknown): string[] | undefined {
+  if (roots === undefined) return undefined;
+  if (
+    !Array.isArray(roots) ||
+    !roots.every((r) => typeof r === "string" && isAbsolute(r))
+  ) {
+    throw new Error("Invalid bridge request payload");
+  }
+  return roots as string[];
 }
 
 async function readRequestBody(req: IncomingMessage): Promise<string> {
@@ -309,11 +376,21 @@ async function handleCallRequest(
 ): Promise<void> {
   const body = await readRequestBody(req);
   const payload = parseBridgeCallPayload(body);
-  const result = await client.callTool({
-    name: payload.name,
-    arguments: payload.args,
-  });
-  writeJson(res, 200, { result: extractToolText(getToolContent(result)) });
+  const result = await client.callTool(
+    {
+      name: payload.name,
+      arguments: payload.args,
+    },
+    payload.roots,
+  );
+  const text = extractToolText(getToolContent(result));
+  if (isToolResultError(result)) {
+    // Surface the tool's own failure text as an error so the CLI throws and
+    // exits non-zero instead of printing success (issue #96).
+    writeJson(res, 200, { error: text || `Tool "${payload.name}" failed` });
+    return;
+  }
+  writeJson(res, 200, { result: text });
 }
 
 export async function handleBridgeRequest(
@@ -615,7 +692,124 @@ function createTransport(): StdioClientTransport {
 }
 
 function createBridgeClient(): Client {
-  return new Client({ name: "chrome-devtools-axi-bridge", version: "1.0.0" });
+  // Declare the `roots` capability so chrome-devtools-mcp asks us for workspace
+  // roots (via `roots/list`) instead of restricting every file write to the OS
+  // temp directory. `listChanged` lets us update the roots per call.
+  return new Client(
+    { name: "chrome-devtools-axi-bridge", version: "1.0.0" },
+    { capabilities: { roots: { listChanged: true } } },
+  );
+}
+
+/** How long {@link RootsAwareClient.applyRoots} waits for chrome-devtools-mcp to
+ * re-read our roots after a `list_changed` notification before proceeding. The
+ * round-trip is local stdio (sub-millisecond); this cap only stops a server
+ * that never re-reads from wedging the call. */
+const ROOTS_FETCH_WAIT_MS = 2_000;
+
+function toRoots(dirs: string[]): Array<{ uri: string; name: string }> {
+  const seen = new Set<string>();
+  const roots: Array<{ uri: string; name: string }> = [];
+  for (const dir of dirs) {
+    const uri = pathToFileURL(dir).href;
+    if (seen.has(uri)) continue;
+    seen.add(uri);
+    roots.push({ uri, name: basename(dir) || dir });
+  }
+  return roots;
+}
+
+function rootUrisEqual(
+  a: Array<{ uri: string }>,
+  b: Array<{ uri: string }>,
+): boolean {
+  if (a.length !== b.length) return false;
+  return a.every((root, i) => root.uri === b[i]?.uri);
+}
+
+/**
+ * Wrap an MCP {@link Client} so it answers `roots/list` and can renegotiate the
+ * workspace roots on demand. Registers the `roots/list` handler that returns the
+ * current roots, and exposes {@link RootsAwareClient.applyRoots}: it swaps in the
+ * requested directories, fires `roots/list_changed`, and waits for the server to
+ * re-read them (bounded) before returning, so the *next* tool call validates
+ * against the new roots rather than the previous set. A no-op when the roots are
+ * unchanged, so repeated calls in the same directory add no round-trips.
+ */
+export function createRootsAwareBridgeClient(client: Client): RootsAwareClient {
+  let currentRoots: Array<{ uri: string; name: string }> = [];
+  let confirmedRoots: Array<{ uri: string; name: string }> | null = [];
+  let onRootsFetched: {
+    resolve: () => void;
+    reject: (error: unknown) => void;
+  } | null = null;
+  let callQueue = Promise.resolve();
+
+  client.setRequestHandler(ListRootsRequestSchema, () => {
+    const notify = onRootsFetched;
+    onRootsFetched = null;
+    if (notify) {
+      setImmediate(() => {
+        void client.ping().then(notify.resolve, notify.reject);
+      });
+    }
+    return { roots: currentRoots };
+  });
+
+  async function applyRootsNow(dirs: string[]): Promise<void> {
+    const next = toRoots(dirs);
+    if (confirmedRoots && rootUrisEqual(next, confirmedRoots)) return;
+    confirmedRoots = null;
+    currentRoots = next;
+    let waiter:
+      | { resolve: () => void; reject: (error: unknown) => void }
+      | undefined;
+    const fetched = new Promise<void>((resolve, reject) => {
+      waiter = { resolve, reject };
+      onRootsFetched = waiter;
+    });
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    try {
+      await Promise.race([
+        (async () => {
+          await client.notification({
+            method: "notifications/roots/list_changed",
+          });
+          await fetched;
+        })(),
+        new Promise<void>((_resolve, reject) => {
+          timeout = setTimeout(
+            () => reject(new Error("Timed out waiting for roots negotiation")),
+            ROOTS_FETCH_WAIT_MS,
+          );
+        }),
+      ]);
+      confirmedRoots = next;
+    } finally {
+      if (timeout) clearTimeout(timeout);
+      if (onRootsFetched === waiter) onRootsFetched = null;
+    }
+  }
+
+  function enqueue<T>(operation: () => Promise<T>): Promise<T> {
+    const result = callQueue.then(operation);
+    callQueue = result.then(
+      () => undefined,
+      () => undefined,
+    );
+    return result;
+  }
+
+  return {
+    listTools: () => client.listTools(),
+    callTool: (request, roots) =>
+      enqueue(async () => {
+        if (roots) await applyRootsNow(roots);
+        return client.callTool(request);
+      }),
+    close: () => client.close(),
+    applyRoots: (dirs) => enqueue(() => applyRootsNow(dirs)),
+  };
 }
 
 async function closeServer(server: Server): Promise<void> {
@@ -639,11 +833,12 @@ export async function runBridge(port = resolveSessionPort()): Promise<void> {
   // a rare and self-correcting path.
   const transport = createTransport();
   const client = createBridgeClient();
+  const bridgeClient = createRootsAwareBridgeClient(client);
   await client.connect(transport);
   logBridgeMessage("Connected to chrome-devtools-mcp");
 
   const sessionName = resolveSessionName();
-  const server = createBridgeServer(client, sessionName);
+  const server = createBridgeServer(bridgeClient, sessionName);
   server.on("error", (error: NodeJS.ErrnoException) => {
     handleBridgeServerError(error, port);
   });

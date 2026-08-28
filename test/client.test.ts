@@ -19,6 +19,7 @@ import {
   callTool,
   CdpError,
   checkBridgeHealth,
+  collectRootDirs,
   ensureBridge,
   getSessionSnapshotIfRunning,
   mapErrorMessage,
@@ -627,15 +628,24 @@ interface FakeCallBridgeOptions {
   listPages?: string;
   result?: string;
   toolResults?: Record<string, string>;
+  /**
+   * Tool names that should respond with an `{ error }` body, mirroring how the
+   * real bridge surfaces an MCP `isError` result. Used to assert the CLI turns
+   * a tool failure into a thrown error rather than silent success (issue #96).
+   */
+  toolErrors?: Record<string, string>;
 }
 
 function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
   port: number;
   calls: { name: string; args: Record<string, unknown> }[];
+  /** The `roots` field seen on each `/call`, in lockstep with `calls`. */
+  roots: (string[] | undefined)[];
   close: () => Promise<void>;
 }> {
   return new Promise((resolveStart, rejectStart) => {
     const calls: { name: string; args: Record<string, unknown> }[] = [];
+    const roots: (string[] | undefined)[] = [];
     const server = createServer((req, res) => {
       if (req.method === "GET" && req.url?.startsWith("/health")) {
         res.setHeader("Content-Type", "application/json");
@@ -652,9 +662,16 @@ function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
           const payload = JSON.parse(body) as {
             name: string;
             args?: Record<string, unknown>;
+            roots?: string[];
           };
           calls.push({ name: payload.name, args: payload.args ?? {} });
+          roots.push(payload.roots);
           res.setHeader("Content-Type", "application/json");
+          const error = opts.toolErrors?.[payload.name];
+          if (error !== undefined) {
+            res.end(JSON.stringify({ error }));
+            return;
+          }
           if (payload.name === "list_pages") {
             res.end(
               JSON.stringify({
@@ -677,6 +694,7 @@ function startFakeCallBridge(opts: FakeCallBridgeOptions): Promise<{
       resolveStart({
         port,
         calls,
+        roots,
         close: () =>
           new Promise<void>((closeResolve) => {
             server.close(() => closeResolve());
@@ -1016,5 +1034,88 @@ describe("callTool pageId routing", () => {
       },
       { listPages: "## Pages\n0: https://a.com/ [selected]" },
     );
+  });
+
+  it("surfaces a tool error result as a thrown CdpError instead of silent success (#96)", async () => {
+    await withFakeBridge(
+      async () => {
+        await callTool("select_page", { pageId: 1 });
+        await expect(
+          callTool("take_screenshot", { filePath: "/tmp/x.png" }),
+        ).rejects.toMatchObject({
+          name: "CdpError",
+          message: expect.stringContaining("Access denied"),
+        });
+      },
+      {
+        toolErrors: {
+          take_screenshot:
+            "Error: Access denied: path /tmp/x.png is not within any of the configured workspace roots.",
+        },
+      },
+    );
+  });
+
+  it("negotiates the nearest existing output ancestor (#96)", async () => {
+    const outputRoot = mkdtempSync(join(tmpdir(), "axi-output-root-"));
+    try {
+      await withFakeBridge(async (fake) => {
+        await callTool("select_page", { pageId: 1 });
+        await callTool("take_screenshot", {
+          filePath: join(outputRoot, "new", "shots", "x.png"),
+        });
+        const idx = fake.calls.findIndex((c) => c.name === "take_screenshot");
+        expect(idx).toBeGreaterThanOrEqual(0);
+        expect(fake.roots[idx]).toEqual([process.cwd(), outputRoot]);
+      });
+    } finally {
+      rmSync(outputRoot, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("collectRootDirs", () => {
+  it("always includes the invoking cwd", () => {
+    expect(collectRootDirs("click", {})).toEqual([process.cwd()]);
+  });
+
+  it("adds roots only for the named tool's output path arguments", () => {
+    const outputRoot = mkdtempSync(join(tmpdir(), "axi-tool-roots-"));
+    try {
+      const networkRoots = collectRootDirs("get_network_request", {
+        responseFilePath: join(outputRoot, "response.json"),
+        requestFilePath: join(outputRoot, "request.json"),
+        filePath: "/private/input.txt",
+      });
+      expect(networkRoots).toEqual([process.cwd(), outputRoot]);
+      expect(
+        collectRootDirs("upload_file", {
+          filePath: "/home/user/.ssh/id_rsa",
+        }),
+      ).toEqual([process.cwd()]);
+    } finally {
+      rmSync(outputRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the nearest existing ancestor for a new output directory", () => {
+    const outputRoot = mkdtempSync(join(tmpdir(), "axi-dir-root-"));
+    try {
+      const roots = collectRootDirs("lighthouse_audit", {
+        outputDirPath: join(outputRoot, "reports", "run-1"),
+      });
+      expect(roots).toEqual([process.cwd(), outputRoot]);
+    } finally {
+      rmSync(outputRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores non-string and empty path arguments", () => {
+    expect(
+      collectRootDirs("take_screenshot", {
+        filePath: "",
+        outputDirPath: 42,
+      }),
+    ).toEqual([process.cwd()]);
   });
 });

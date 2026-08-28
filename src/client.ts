@@ -5,6 +5,7 @@
 import { execFileSync, spawn } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
 import { request } from "node:http";
+import { dirname } from "node:path";
 import { AxiError } from "axi-sdk-js";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
@@ -507,10 +508,67 @@ async function postTool(
   port: number,
   name: string,
   args: Record<string, unknown>,
-  timeoutMs?: number,
+  opts: { roots?: string[]; timeoutMs?: number } = {},
 ): Promise<string> {
-  const resp = await httpPost(port, "/call", { name, args }, timeoutMs);
+  const body: Record<string, unknown> = { name, args };
+  if (opts.roots && opts.roots.length > 0) body.roots = opts.roots;
+  const resp = await httpPost(port, "/call", body, opts.timeoutMs);
   return parseCallResponse(resp);
+}
+
+/**
+ * Tool argument keys whose value is a caller-supplied output path, resolved to
+ * an absolute path by `resolveOutputPath` before it reaches here. The nearest
+ * existing ancestor of their parent directory (or of a directory argument
+ * itself) is negotiated as an MCP workspace root, so the write is not restricted
+ * to the OS temp directory and missing directories can be created beneath an
+ * allowed root (issue #96). Add a key here when a new file-writing tool argument
+ * is introduced.
+ */
+const FILE_OUTPUT_ARGS_BY_TOOL = new Map<string, readonly string[]>([
+  ["take_screenshot", ["filePath"]],
+  ["get_network_request", ["responseFilePath", "requestFilePath"]],
+  ["performance_start_trace", ["filePath"]],
+  ["performance_stop_trace", ["filePath"]],
+  ["take_memory_snapshot", ["filePath"]],
+]);
+const DIR_OUTPUT_ARGS_BY_TOOL = new Map<string, readonly string[]>([
+  ["lighthouse_audit", ["outputDirPath"]],
+]);
+
+function nearestExistingAncestor(path: string): string {
+  let candidate = path;
+  while (!existsSync(candidate)) {
+    const parent = dirname(candidate);
+    if (parent === candidate) return candidate;
+    candidate = parent;
+  }
+  return candidate;
+}
+
+/**
+ * The workspace roots a call needs: always the invoking cwd (so writes under it
+ * pass), plus the nearest existing ancestor of any output path argument (so a
+ * write outside cwd, e.g. `$HOME/a.png`, passes too).
+ */
+export function collectRootDirs(
+  name: string,
+  args: Record<string, unknown>,
+): string[] {
+  const dirs = new Set<string>([process.cwd()]);
+  for (const key of FILE_OUTPUT_ARGS_BY_TOOL.get(name) ?? []) {
+    const value = args[key];
+    if (typeof value === "string" && value.length > 0) {
+      dirs.add(nearestExistingAncestor(dirname(value)));
+    }
+  }
+  for (const key of DIR_OUTPUT_ARGS_BY_TOOL.get(name) ?? []) {
+    const value = args[key];
+    if (typeof value === "string" && value.length > 0) {
+      dirs.add(nearestExistingAncestor(value));
+    }
+  }
+  return [...dirs];
 }
 
 /**
@@ -555,7 +613,9 @@ export async function callTool(
 
   try {
     const resolved = resolveToolArgs(name, args);
-    const result = await postTool(port, name, resolved);
+    const result = await postTool(port, name, resolved, {
+      roots: collectRootDirs(name, resolved),
+    });
     rememberToolRouting(name, resolved, result);
     return result;
   } catch (err) {
@@ -626,7 +686,12 @@ export async function getSessionSnapshotIfRunning(): Promise<string | null> {
   try {
     const pageId = getSelectedPageId();
     if (pageId === null) return null;
-    return await postTool(pidInfo.port, "take_snapshot", { pageId }, 5000);
+    return await postTool(
+      pidInfo.port,
+      "take_snapshot",
+      { pageId },
+      { timeoutMs: 5000 },
+    );
   } catch {
     return null;
   }

@@ -63,6 +63,12 @@ The default (unset) session keeps port 9224 and the legacy `~/.chrome-devtools-a
 
 chrome-devtools-mcp 1.8+ requires `pageId` on page-scoped tools by default. `callTool` (`src/client.ts`) injects the session's last AXI `select_page` id (`src/selected-page.ts`); `list_pages` is display-only and never sets routing. `new_page` records the unique complete row in its own dump whose URL matches `args.url` (`about:blank` plus the requested URL is fine); title continuations, zero matches, and two matching URLs leave the id unset so the next page-scoped call fails loud until `select_page`. The `pages` selected column overlays `getSelectedPageId()`, not MCP `[selected]`. Missing selection fails loudly with "No page is currently selected". `close_page` of the selected id clears it.
 
+MCP tool failures and file-write roots (issue #96): the bridge declares the MCP `roots` capability (`createRootsAwareBridgeClient`), so chrome-devtools-mcp's `validatePath` no longer restricts file writes to `os.tmpdir()`.
+`callTool` sends the roots each call needs: the invoking cwd plus the nearest existing ancestor of any output path (`collectRootDirs`, keyed by `FILE_OUTPUT_ARGS_BY_TOOL`/`DIR_OUTPUT_ARGS_BY_TOOL`).
+The bridge negotiates them via `applyRoots` (a `roots/list_changed` round-trip) before the tool runs.
+The bridge also surfaces an MCP `isError` result as a `{ error }` response (`isToolResultError` in `handleCallRequest`) rather than the tool text, so a denied or failed write throws a `CdpError` and exits non-zero instead of printing false success.
+Both fixes live at the single `callTool`/`handleCallRequest` chokepoint, so every file-writing command inherits them.
+
 ### Snapshot generations and STALE_REF
 
 Snapshots are accessibility trees whose interactive elements carry `uid=` refs.

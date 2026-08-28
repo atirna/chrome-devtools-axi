@@ -1,12 +1,13 @@
-import { describe, expect, it, beforeEach, afterEach } from "vitest";
+import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { IncomingMessage, ServerResponse } from "node:http";
 import { Socket } from "node:net";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
   buildTransportArgs,
+  createRootsAwareBridgeClient,
   detectGlobalMcpPath,
   extractHostHeaderHostname,
   extractToolText,
@@ -15,6 +16,7 @@ import {
   isAllowedBridgeHost,
   isRequestAllowed,
   isRequestOriginAllowed,
+  isToolResultError,
   handleBridgeServerError,
   isBridgeClientConnected,
   isBridgeTargetReachable,
@@ -24,6 +26,7 @@ import {
   resolveTransportSpec,
   type BridgeClient,
 } from "../src/bridge.js";
+import { pathToFileURL } from "node:url";
 
 describe("extractToolText", () => {
   it("joins text blocks and ignores non-text content", () => {
@@ -54,6 +57,48 @@ describe("parseBridgeCallPayload", () => {
     expect(() => parseBridgeCallPayload("{")).toThrow(
       "Invalid bridge request payload",
     );
+  });
+
+  it("parses an optional roots array of directories", () => {
+    const workspaceRoot = resolve("workspace");
+    const homeRoot = resolve("home", "user");
+    const result = parseBridgeCallPayload(
+      JSON.stringify({
+        name: "take_screenshot",
+        args: { filePath: join(workspaceRoot, "a.png") },
+        roots: [workspaceRoot, homeRoot],
+      }),
+    );
+
+    expect(result).toEqual({
+      name: "take_screenshot",
+      args: { filePath: join(workspaceRoot, "a.png") },
+      roots: [workspaceRoot, homeRoot],
+    });
+  });
+
+  it("rejects roots that are not an array of absolute paths", () => {
+    expect(() =>
+      parseBridgeCallPayload(
+        JSON.stringify({ name: "x", roots: [resolve("workspace"), ""] }),
+      ),
+    ).toThrow("Invalid bridge request payload");
+    expect(() => parseBridgeCallPayload('{"name":"x","roots":"/w"}')).toThrow(
+      "Invalid bridge request payload",
+    );
+    expect(() =>
+      parseBridgeCallPayload('{"name":"x","roots":["relative/path"]}'),
+    ).toThrow("Invalid bridge request payload");
+  });
+});
+
+describe("isToolResultError", () => {
+  it("is true only when the result carries isError: true", () => {
+    expect(isToolResultError({ isError: true, content: [] })).toBe(true);
+    expect(isToolResultError({ isError: false, content: [] })).toBe(false);
+    expect(isToolResultError({ content: [] })).toBe(false);
+    expect(isToolResultError(null)).toBe(false);
+    expect(isToolResultError("boom")).toBe(false);
   });
 });
 
@@ -975,6 +1020,347 @@ describe("handleBridgeRequest anti-rebinding gate", () => {
 
     expect(captured.statusCode).toBe(200);
     expect(isRequestAllowed(makeRequest("GET", "/tools"))).toBe(true);
+  });
+});
+
+describe("handleBridgeRequest /call error + roots", () => {
+  it("surfaces an isError tool result as { error } so the CLI fails loudly (#96)", async () => {
+    const client: BridgeClient = {
+      listTools: async () => ({ tools: [] }),
+      callTool: async () => ({
+        isError: true,
+        content: [
+          {
+            type: "text",
+            text: "Error: Access denied: path /home/u/a.png is not within any of the configured workspace roots.",
+          },
+        ],
+      }),
+      close: async () => {},
+    };
+    const { res, captured } = makeResponse();
+
+    await handleBridgeRequest(
+      client,
+      makeRequest(
+        "POST",
+        "/call",
+        { host: "127.0.0.1:9224" },
+        JSON.stringify({ name: "take_screenshot", args: { filePath: "x" } }),
+      ),
+      res,
+    );
+
+    expect(captured.statusCode).toBe(200);
+    const body = JSON.parse(captured.body);
+    expect(body.result).toBeUndefined();
+    expect(body.error).toContain("Access denied");
+  });
+
+  it("negotiates the payload's roots before invoking the tool (#96)", async () => {
+    const workspaceRoot = resolve("workspace");
+    const homeRoot = resolve("home", "user");
+    let appliedRoots: string[] | undefined;
+    const client: BridgeClient = {
+      listTools: async () => ({ tools: [] }),
+      callTool: async (_request, roots) => {
+        appliedRoots = roots;
+        return { content: [{ type: "text", text: "ok" }] };
+      },
+      close: async () => {},
+    };
+    const { res, captured } = makeResponse();
+
+    await handleBridgeRequest(
+      client,
+      makeRequest(
+        "POST",
+        "/call",
+        { host: "127.0.0.1:9224" },
+        JSON.stringify({
+          name: "take_screenshot",
+          args: { filePath: join(workspaceRoot, "a.png") },
+          roots: [workspaceRoot, homeRoot],
+        }),
+      ),
+      res,
+    );
+
+    expect(appliedRoots).toEqual([workspaceRoot, homeRoot]);
+    expect(captured.statusCode).toBe(200);
+    expect(JSON.parse(captured.body)).toEqual({ result: "ok" });
+  });
+});
+
+describe("createRootsAwareBridgeClient", () => {
+  function makeFakeMcpClient() {
+    let rootsListHandler: (() => { roots: unknown }) | null = null;
+    const notifications: Array<{ method: string }> = [];
+    const client = {
+      setRequestHandler: (
+        _schema: unknown,
+        handler: () => { roots: unknown },
+      ) => {
+        rootsListHandler = handler;
+      },
+      // Simulate chrome-devtools-mcp re-reading roots after a list_changed.
+      notification: async (n: { method: string }) => {
+        notifications.push(n);
+        rootsListHandler?.();
+      },
+      ping: async () => ({}),
+      listTools: async () => ({ tools: [] }),
+      callTool: async () => ({ content: [] }),
+      close: async () => {},
+    };
+    return {
+      client,
+      notifications,
+      invokeRootsList: () => rootsListHandler?.(),
+    };
+  }
+
+  it("answers roots/list with the negotiated directories as file URIs", async () => {
+    const workspaceRoot = resolve("workspace");
+    const outputRoot = resolve("output");
+    const fake = makeFakeMcpClient();
+    const rootsClient = createRootsAwareBridgeClient(fake.client as any);
+
+    await rootsClient.applyRoots([workspaceRoot, outputRoot]);
+
+    expect(fake.notifications).toEqual([
+      { method: "notifications/roots/list_changed" },
+    ]);
+    expect(fake.invokeRootsList()).toEqual({
+      roots: [
+        {
+          uri: pathToFileURL(workspaceRoot).href,
+          name: "workspace",
+        },
+        { uri: pathToFileURL(outputRoot).href, name: "output" },
+      ],
+    });
+  });
+
+  it("does not re-notify when the roots are unchanged", async () => {
+    const workspaceRoot = resolve("workspace");
+    const fake = makeFakeMcpClient();
+    const rootsClient = createRootsAwareBridgeClient(fake.client as any);
+
+    await rootsClient.applyRoots([workspaceRoot]);
+    await rootsClient.applyRoots([workspaceRoot]);
+
+    expect(fake.notifications).toHaveLength(1);
+  });
+
+  it("retries unchanged roots after a fetch times out", async () => {
+    const workspaceRoot = resolve("workspace");
+    vi.useFakeTimers();
+    try {
+      const notifications: Array<{ method: string }> = [];
+      const client = {
+        setRequestHandler: () => {},
+        notification: async (notification: { method: string }) => {
+          notifications.push(notification);
+        },
+        ping: async () => ({}),
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {},
+      };
+      const rootsClient = createRootsAwareBridgeClient(client as any);
+
+      const first = expect(
+        rootsClient.applyRoots([workspaceRoot]),
+      ).rejects.toThrow("Timed out waiting for roots negotiation");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await first;
+      const second = expect(
+        rootsClient.applyRoots([workspaceRoot]),
+      ).rejects.toThrow("Timed out waiting for roots negotiation");
+      await vi.advanceTimersByTimeAsync(2_000);
+      await second;
+
+      expect(notifications).toHaveLength(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("times out when sending the roots notification stalls", async () => {
+    const workspaceRoot = resolve("workspace");
+    vi.useFakeTimers();
+    try {
+      const client = {
+        setRequestHandler: () => {},
+        notification: () => new Promise<void>(() => {}),
+        ping: async () => ({}),
+        listTools: async () => ({ tools: [] }),
+        callTool: async () => ({ content: [] }),
+        close: async () => {},
+      };
+      const rootsClient = createRootsAwareBridgeClient(client as any);
+
+      const negotiation = expect(
+        rootsClient.applyRoots([workspaceRoot]),
+      ).rejects.toThrow("Timed out waiting for roots negotiation");
+      await vi.advanceTimersByTimeAsync(2_000);
+
+      await negotiation;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("renegotiates previously confirmed roots after ambiguous failure", async () => {
+    const firstRoot = resolve("first-root");
+    const secondRoot = resolve("second-root");
+    let rootsListHandler: (() => { roots: unknown }) | null = null;
+    let pingCalls = 0;
+    const notifications: Array<{ method: string }> = [];
+    const client = {
+      setRequestHandler: (
+        _schema: unknown,
+        handler: () => { roots: unknown },
+      ) => {
+        rootsListHandler = handler;
+      },
+      notification: async (notification: { method: string }) => {
+        notifications.push(notification);
+        rootsListHandler?.();
+      },
+      ping: async () => {
+        pingCalls += 1;
+        if (pingCalls === 2) throw new Error("confirmation failed");
+        return {};
+      },
+      listTools: async () => ({ tools: [] }),
+      callTool: async () => ({ content: [] }),
+      close: async () => {},
+    };
+    const rootsClient = createRootsAwareBridgeClient(client as any);
+
+    await rootsClient.applyRoots([firstRoot]);
+    await expect(rootsClient.applyRoots([secondRoot])).rejects.toThrow(
+      "confirmation failed",
+    );
+    await rootsClient.applyRoots([firstRoot]);
+
+    expect(notifications).toHaveLength(3);
+  });
+
+  it("de-duplicates repeated directories", async () => {
+    const workspaceRoot = resolve("workspace");
+    const homeRoot = resolve("home", "user");
+    const fake = makeFakeMcpClient();
+    const rootsClient = createRootsAwareBridgeClient(fake.client as any);
+
+    await rootsClient.applyRoots([workspaceRoot, workspaceRoot, homeRoot]);
+
+    const listed = fake.invokeRootsList() as {
+      roots: Array<{ uri: string }>;
+    };
+    expect(listed.roots.map((r) => r.uri)).toEqual([
+      pathToFileURL(workspaceRoot).href,
+      pathToFileURL(homeRoot).href,
+    ]);
+  });
+
+  it("keeps each roots negotiation atomic with its concurrent tool call", async () => {
+    const firstRoot = resolve("first-root");
+    const secondRoot = resolve("second-root");
+    let rootsListHandler: (() => { roots: Array<{ uri: string }> }) | null =
+      null;
+    let releaseFirstCall: (() => void) | undefined;
+    let firstCallStarted: (() => void) | undefined;
+    const firstStarted = new Promise<void>((resolve) => {
+      firstCallStarted = resolve;
+    });
+    const firstRelease = new Promise<void>((resolve) => {
+      releaseFirstCall = resolve;
+    });
+    const observed: Array<{ name: string; roots: string[] }> = [];
+    const client = {
+      setRequestHandler: (
+        _schema: unknown,
+        handler: () => { roots: Array<{ uri: string }> },
+      ) => {
+        rootsListHandler = handler;
+      },
+      notification: async () => {
+        rootsListHandler?.();
+      },
+      ping: async () => ({}),
+      listTools: async () => ({ tools: [] }),
+      callTool: async ({ name }: { name: string }) => {
+        observed.push({
+          name,
+          roots: rootsListHandler?.().roots.map((root) => root.uri) ?? [],
+        });
+        if (name === "first") {
+          firstCallStarted?.();
+          await firstRelease;
+        }
+        return { content: [] };
+      },
+      close: async () => {},
+    };
+    const rootsClient = createRootsAwareBridgeClient(client as any);
+
+    const first = rootsClient.callTool({ name: "first", arguments: {} }, [
+      firstRoot,
+    ]);
+    await firstStarted;
+    const second = rootsClient.callTool({ name: "second", arguments: {} }, [
+      secondRoot,
+    ]);
+
+    expect(observed).toEqual([
+      { name: "first", roots: [pathToFileURL(firstRoot).href] },
+    ]);
+    releaseFirstCall?.();
+    await Promise.all([first, second]);
+    expect(observed).toEqual([
+      { name: "first", roots: [pathToFileURL(firstRoot).href] },
+      { name: "second", roots: [pathToFileURL(secondRoot).href] },
+    ]);
+  });
+
+  it("completes a server round trip after returning updated roots", async () => {
+    const workspaceRoot = resolve("workspace");
+    let rootsListHandler: (() => { roots: unknown }) | null = null;
+    let rootsResponseReturned = false;
+    const events: string[] = [];
+    const client = {
+      setRequestHandler: (
+        _schema: unknown,
+        handler: () => { roots: unknown },
+      ) => {
+        rootsListHandler = handler;
+      },
+      notification: async () => {
+        rootsListHandler?.();
+        rootsResponseReturned = true;
+      },
+      ping: async () => {
+        expect(rootsResponseReturned).toBe(true);
+        events.push("ping");
+        return {};
+      },
+      listTools: async () => ({ tools: [] }),
+      callTool: async () => {
+        events.push("tool");
+        return { content: [] };
+      },
+      close: async () => {},
+    };
+    const rootsClient = createRootsAwareBridgeClient(client as any);
+
+    await rootsClient.callTool({ name: "take_screenshot", arguments: {} }, [
+      workspaceRoot,
+    ]);
+
+    expect(events).toEqual(["ping", "tool"]);
   });
 });
 
