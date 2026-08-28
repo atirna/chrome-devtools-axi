@@ -13,7 +13,10 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { AxiError } from "axi-sdk-js";
-import { BRIDGE_PORT_IN_USE_EXIT_CODE } from "../src/bridge.js";
+import {
+  BRIDGE_PORT_IN_USE_EXIT_CODE,
+  PAGE_IDENTITY_CHANGED_ERROR,
+} from "../src/bridge.js";
 import {
   buildBridgeEarlyExitError,
   callTool,
@@ -60,6 +63,25 @@ describe("mapErrorMessage", () => {
 
     expect(error.code).toBe("BROWSER_ERROR");
     expect(error.message).toBe("Page crashed");
+  });
+
+  it("translates missing MCP page identities without leaking dependency text", () => {
+    const error = mapErrorMessage("Error: No page found");
+
+    expect(error.code).toBe("BROWSER_ERROR");
+    expect(error.message).toBe("The selected page is no longer available");
+    expect(error.suggestions).toContain(
+      "Run `chrome-devtools-axi pages` to list the remaining tabs",
+    );
+  });
+
+  it("does not translate a body that merely mentions the missing-page phrase", () => {
+    const error = mapErrorMessage(
+      'Error: Evaluation failed: Error: No page found for slug "x"',
+    );
+
+    expect(error.message).toContain("Evaluation failed");
+    expect(error.message).not.toBe("The selected page is no longer available");
   });
 });
 
@@ -979,6 +1001,165 @@ describe("callTool pageId routing", () => {
           ].join("\n"),
         },
       },
+    );
+  });
+
+  it("clears a stale persisted selection when MCP says its page is gone", async () => {
+    await withFakeBridge(
+      async (fake) => {
+        await callTool("select_page", { pageId: 2 });
+        await expect(callTool("take_snapshot")).rejects.toMatchObject({
+          name: "CdpError",
+          code: "BROWSER_ERROR",
+          message: "Page 2 is no longer available",
+          suggestions: expect.arrayContaining([
+            "Run `chrome-devtools-axi pages` to list the remaining tabs",
+          ]),
+        });
+        await expect(callTool("take_snapshot")).rejects.toMatchObject({
+          message: "No page is currently selected",
+        });
+        expect(fake.calls).toEqual([
+          { name: "select_page", args: { pageId: 2 } },
+          { name: "take_snapshot", args: { pageId: 2 } },
+        ]);
+      },
+      {
+        toolErrors: { take_snapshot: "Error: No page found" },
+      },
+    );
+  });
+
+  it("keeps routing and surfaces the real failure when page text merely contains the missing-page phrase", async () => {
+    await withFakeBridge(
+      async (fake) => {
+        await callTool("select_page", { pageId: 2 });
+        await expect(
+          callTool("evaluate_script", { function: "() => 1" }),
+        ).rejects.toMatchObject({
+          name: "CdpError",
+          message: expect.stringContaining("Evaluation failed"),
+        });
+        // The tab is alive, so the selection survives and the next call routes.
+        await callTool("take_snapshot");
+        expect(fake.calls).toEqual([
+          { name: "select_page", args: { pageId: 2 } },
+          {
+            name: "evaluate_script",
+            args: { function: "() => 1", pageId: 2 },
+          },
+          { name: "take_snapshot", args: { pageId: 2 } },
+        ]);
+      },
+      {
+        toolErrors: {
+          evaluate_script: [
+            "## Pages",
+            "2: https://shop.example/search?q=No+page+found",
+            "Error: Evaluation failed: Error: No page found",
+          ].join("\n"),
+        },
+      },
+    );
+  });
+
+  it("keeps routing when a dialog message opens a forged missing-page line mid-body", async () => {
+    await withFakeBridge(
+      async (fake) => {
+        await callTool("select_page", { pageId: 2 });
+        await expect(callTool("take_snapshot")).rejects.toMatchObject({
+          name: "CdpError",
+          message: expect.stringContaining("handle_dialog"),
+        });
+        await callTool("click", { uid: "4" });
+        expect(fake.calls).toEqual([
+          { name: "select_page", args: { pageId: 2 } },
+          { name: "take_snapshot", args: { pageId: 2 } },
+          { name: "click", args: { uid: "4", pageId: 2 } },
+        ]);
+      },
+      {
+        toolErrors: {
+          // alert("x\nNo page found") - chrome-devtools-mcp interpolates the
+          // dialog message verbatim, so the page owns a whole line here.
+          take_snapshot: [
+            "# Open dialog",
+            "alert: x",
+            "No page found",
+            "Call handle_dialog to handle it before continuing.",
+            "Error: A dialog is open, call handle_dialog first",
+          ].join("\n"),
+        },
+      },
+    );
+  });
+
+  it("keeps a live tab's routing when a different pageId is the one MCP cannot resolve", async () => {
+    await withFakeBridge(
+      async (fake) => {
+        await callTool("select_page", { pageId: 3 });
+        await expect(
+          callTool("close_page", { pageId: 9 }),
+        ).rejects.toMatchObject({
+          name: "CdpError",
+          code: "BROWSER_ERROR",
+          message: "Page 9 is no longer available",
+        });
+        // Page 3 is still open, so its routing must survive page 9's failure.
+        await callTool("take_snapshot");
+        expect(fake.calls).toEqual([
+          { name: "select_page", args: { pageId: 3 } },
+          { name: "close_page", args: { pageId: 9 } },
+          { name: "take_snapshot", args: { pageId: 3 } },
+        ]);
+      },
+      {
+        toolErrors: { close_page: "Error: No page found" },
+      },
+    );
+  });
+
+  it("clears the selection when MCP reports the selected page was closed", async () => {
+    await withFakeBridge(
+      async (fake) => {
+        await callTool("select_page", { pageId: 5 });
+        await expect(callTool("take_snapshot")).rejects.toMatchObject({
+          name: "CdpError",
+          code: "BROWSER_ERROR",
+          message: "Page 5 is no longer available",
+        });
+        await expect(callTool("take_snapshot")).rejects.toMatchObject({
+          message: "No page is currently selected",
+        });
+        expect(fake.calls).toEqual([
+          { name: "select_page", args: { pageId: 5 } },
+          { name: "take_snapshot", args: { pageId: 5 } },
+        ]);
+      },
+      {
+        toolErrors: {
+          // Upstream interpolates the list_pages tool name into this sentence.
+          take_snapshot:
+            "Error: The selected page has been closed. Call browser_list_pages to see the open tabs.",
+        },
+      },
+    );
+  });
+
+  it("reports a reconnect-invalidated call as an actionable BROWSER_ERROR", async () => {
+    await withFakeBridge(
+      async () => {
+        await callTool("select_page", { pageId: 1 });
+        await expect(callTool("take_snapshot")).rejects.toMatchObject({
+          name: "CdpError",
+          code: "BROWSER_ERROR",
+          message: PAGE_IDENTITY_CHANGED_ERROR,
+          suggestions: expect.arrayContaining([
+            "Run `chrome-devtools-axi pages` to list the current tabs and their new ids",
+          ]),
+        });
+      },
+      { toolErrors: { take_snapshot: PAGE_IDENTITY_CHANGED_ERROR } },
     );
   });
 

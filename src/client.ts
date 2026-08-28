@@ -9,6 +9,7 @@ import { dirname } from "node:path";
 import { AxiError } from "axi-sdk-js";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
+  PAGE_IDENTITY_CHANGED_ERROR,
   resolveBridgeScript,
 } from "./bridge-script.js";
 import { needsPageId } from "./pages.js";
@@ -610,9 +611,10 @@ export async function callTool(
   args: Record<string, unknown> = {},
 ): Promise<string> {
   const port = await ensureBridge();
+  let resolved = args;
 
   try {
-    const resolved = resolveToolArgs(name, args);
+    resolved = resolveToolArgs(name, args);
     const result = await postTool(port, name, resolved, {
       roots: collectRootDirs(name, resolved),
     });
@@ -621,11 +623,98 @@ export async function callTool(
   } catch (err) {
     if (err instanceof CdpError) throw err;
     const message = err instanceof Error ? err.message : String(err);
+    if (isMissingPageError(message)) {
+      const pageId =
+        typeof resolved.pageId === "number" ? resolved.pageId : null;
+      if (pageId !== null && getSelectedPageId() === pageId) {
+        clearSelectedPageId();
+      }
+      throw missingPageError(pageId);
+    }
     throw mapErrorMessage(message);
   }
 }
 
+/**
+ * chrome-devtools-mcp text the bridge flattens into a `/call` error body: a
+ * bare line when the tool handler rethrows, or an `Error: `-prefixed line when
+ * the response builder appends it. `The selected page has been closed.` leads a
+ * sentence that interpolates the `list_pages` tool name, so only its stable
+ * clause is anchored.
+ */
+const MCP_MISSING_PAGE_LINE = "No page found";
+const MCP_CLOSED_PAGE_LINE_PREFIX = "The selected page has been closed.";
+
+/**
+ * Whether the bridge error body names a page chrome-devtools-mcp itself could
+ * not resolve. The body is the *whole* flattened MCP response, and page-owned
+ * strings upstream interpolates verbatim (a dialog message, a title) may carry
+ * raw newlines, so any line in the middle of the body can be page-controlled.
+ * Only the final non-empty line is consulted, which rules those out.
+ *
+ * It does NOT make the marker unforgeable. Upstream's last element is
+ * `Error: <errorMessage>` with the raw exception message interpolated, and
+ * that message can itself contain a raw newline, so a page that throws
+ * "\nNo page found" ends the body with a line that is exactly the sentence.
+ * No purely text-based matcher can separate page bytes inside `errorMessage`
+ * from upstream's own sentence. The consequence is fail-closed - a spurious
+ * loud error plus dropped routing, never a silent retarget - and the sibling
+ * reconnect matcher in `src/bridge.ts` is unaffected, because a forged first
+ * line still carries upstream's literal `Error: ` prefix.
+ *
+ * UNVERIFIED DEPENDENCY CONTRACT: this assumes chrome-devtools-mcp appends
+ * `Error: <message>` LAST, after every page-derived block (and, for the
+ * sibling reconnect matcher in `src/bridge.ts`, emits its notice FIRST).
+ * Nothing in the test suite pins that order - chrome-devtools-mcp is spawned
+ * via npx, not installed as a devDependency, so there is no build to assert
+ * against. If upstream reorders, a genuine missing page falls through to
+ * `mapErrorMessage` and surfaces as a less specific error rather than
+ * retargeting anything; upstream hands out page ids from a process-wide
+ * monotonic counter, so a stale id fails to resolve instead of landing on an
+ * unrelated page.
+ */
+function isMissingPageError(message: string): boolean {
+  const line = lastNonEmptyLine(message).replace(/^Error:\s*/, "");
+  return (
+    line === MCP_MISSING_PAGE_LINE ||
+    line.startsWith(MCP_CLOSED_PAGE_LINE_PREFIX)
+  );
+}
+
+function lastNonEmptyLine(message: string): string {
+  const lines = message.split(/\r?\n/);
+  for (let i = lines.length - 1; i >= 0; i -= 1) {
+    const line = lines[i].trim();
+    if (line) return line;
+  }
+  return "";
+}
+
+function missingPageError(pageId: number | null): CdpError {
+  return new CdpError(
+    pageId === null
+      ? "The selected page is no longer available"
+      : `Page ${pageId} is no longer available`,
+    "BROWSER_ERROR",
+    [
+      "Run `chrome-devtools-axi pages` to list the remaining tabs",
+      "Run `chrome-devtools-axi selectpage <id>` to select a tab, or `chrome-devtools-axi open <url>` to open one",
+    ],
+  );
+}
+
+function pageIdentityChangedError(): CdpError {
+  return new CdpError(PAGE_IDENTITY_CHANGED_ERROR, "BROWSER_ERROR", [
+    "Run `chrome-devtools-axi pages` to list the current tabs and their new ids",
+    "Run `chrome-devtools-axi selectpage <id>` to select a tab, then retry",
+  ]);
+}
+
 export function mapErrorMessage(message: string): CdpError {
+  if (message === PAGE_IDENTITY_CHANGED_ERROR) {
+    return pageIdentityChangedError();
+  }
+  if (isMissingPageError(message)) return missingPageError(null);
   if (message.includes("ECONNREFUSED") || message.includes("ECONNRESET")) {
     return new CdpError("Bridge is not running", "BRIDGE_NOT_READY", [
       "Run `chrome-devtools-axi open <url>` — the bridge starts automatically",

@@ -34,8 +34,10 @@ import { basename, dirname, isAbsolute, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import {
   BRIDGE_PORT_IN_USE_EXIT_CODE,
+  PAGE_IDENTITY_CHANGED_ERROR,
   resolveBridgeScript,
 } from "./bridge-script.js";
+import { clearSelectedPageId } from "./selected-page.js";
 import {
   resolveSessionName,
   resolveSessionPidFile,
@@ -44,7 +46,11 @@ import {
 
 // Re-exported so existing bridge consumers keep a single import surface; the
 // definitions live in the MCP-free ./bridge-script.js (see its header).
-export { BRIDGE_PORT_IN_USE_EXIT_CODE, resolveBridgeScript };
+export {
+  BRIDGE_PORT_IN_USE_EXIT_CODE,
+  PAGE_IDENTITY_CHANGED_ERROR,
+  resolveBridgeScript,
+};
 
 export interface BridgeContentBlock {
   type: string;
@@ -110,13 +116,27 @@ export async function isBridgeClientConnected(
  * not that the attached browser is still alive. Used by `/health?deep=1` so
  * `ensureBridge` can detect a stale bridge after the user kills + restarts
  * the underlying Chrome/Electron target.
+ *
+ * It also reports chrome-devtools-mcp's one-shot reconnect marker (see
+ * {@link didMcpPageIdentityChange}) rather than only its own reachability:
+ * `ensureBridge` deep-probes before every command, so after an in-process
+ * browser reconnect this `list_pages` is the first call to see the marker and
+ * consumes it, leaving none for the `/call` that follows.
  */
 export async function isBridgeTargetReachable(
   client: BridgeClient,
-): Promise<{ ok: true } | { ok: false; reason: string }> {
+): Promise<
+  { ok: true; pageIdentityChanged: boolean } | { ok: false; reason: string }
+> {
   try {
-    await client.callTool({ name: "list_pages", arguments: {} });
-    return { ok: true };
+    const result = await client.callTool({
+      name: "list_pages",
+      arguments: {},
+    });
+    return {
+      ok: true,
+      pageIdentityChanged: didMcpPageIdentityChange(result),
+    };
   } catch (error) {
     return { ok: false, reason: getErrorMessage(error) };
   }
@@ -288,6 +308,58 @@ export function isToolResultError(result: unknown): boolean {
   );
 }
 
+const MCP_RECONNECT_NOTICE_PREFIX =
+  "Note: the browser was restarted or reconnected since the last call.";
+
+/**
+ * chrome-devtools-mcp keeps its stdio process alive when Chrome reconnects,
+ * but deliberately reissues every page id. Its one-shot reconnect marker is
+ * the authoritative identity boundary; the bridge must observe it before the
+ * response is flattened or a persisted AXI selection can outlive the ids it
+ * belongs to.
+ */
+export function didMcpPageIdentityChange(
+  result: unknown,
+  flattenedText?: string,
+): boolean {
+  if (hasStructuredReconnectMarker(result)) return true;
+
+  // Upstream only includes structuredContent behind its experimental flag; its
+  // default protocol response carries the same one-shot marker as text. Only
+  // the first line is consulted: page-owned strings that upstream interpolates
+  // verbatim (a dialog message, a title) may contain raw newlines and would
+  // otherwise open a line of their own that starts with this clause. Within
+  // that first line the match stays a prefix, so a reworded tail or a renamed
+  // `list_pages` still registers.
+  //
+  // UNVERIFIED DEPENDENCY CONTRACT: this assumes chrome-devtools-mcp emits the
+  // reconnect notice as the FIRST line of the flattened body (and, for the
+  // sibling matcher in `src/client.ts`, appends `Error: <message>` LAST).
+  // Nothing in the test suite pins that order - chrome-devtools-mcp is spawned
+  // via npx, not installed as a devDependency, so there is no build to assert
+  // against. If upstream reorders, the consequence is a less accurate message,
+  // not a silent retarget: `isMissingPageError` is an independent net on the
+  // last non-empty line, and upstream hands out page ids from a process-wide
+  // monotonic counter, so a stale id fails to resolve rather than landing on
+  // an unrelated page.
+  const text = flattenedText ?? extractToolText(getToolContent(result));
+  const [firstLine = ""] = text.split(/\r?\n/, 1);
+  return firstLine.trim().startsWith(MCP_RECONNECT_NOTICE_PREFIX);
+}
+
+function hasStructuredReconnectMarker(result: unknown): boolean {
+  if (!result || typeof result !== "object") return false;
+  if (!("structuredContent" in result)) return false;
+  const structured = (result as { structuredContent?: unknown })
+    .structuredContent;
+  return (
+    !!structured &&
+    typeof structured === "object" &&
+    "reconnected" in structured &&
+    (structured as { reconnected?: unknown }).reconnected === true
+  );
+}
+
 export function parseBridgeCallPayload(body: string): BridgeCallPayload {
   let payload: { name?: unknown; args?: unknown; roots?: unknown };
   try {
@@ -373,6 +445,7 @@ async function handleCallRequest(
   client: BridgeClient,
   req: IncomingMessage,
   res: ServerResponse,
+  onPageIdentityChanged?: () => void,
 ): Promise<void> {
   const body = await readRequestBody(req);
   const payload = parseBridgeCallPayload(body);
@@ -384,6 +457,25 @@ async function handleCallRequest(
     payload.roots,
   );
   const text = extractToolText(getToolContent(result));
+  const pageIdentityChanged = didMcpPageIdentityChange(result, text);
+  if (pageIdentityChanged) onPageIdentityChanged?.();
+  // The reconnect that reissued every page id happened *during* this call, so
+  // an explicit `pageId` in the request was resolved against the new id space:
+  // the content may belong to another tab, and upstream's own failure text
+  // ("No page found", because page ids come from a monotonic counter) names a
+  // missing page instead of the reconnect that caused it. Report the identity
+  // boundary either way, ahead of the tool-error branch, so the caller
+  // re-selects rather than hunting for a closed tab. Only a call that named no
+  // page - `list_pages`, `new_page` - targeted no particular tab and is left
+  // alone. The home view probe is NOT one of those: it always sends the
+  // persisted `pageId`, so after a reconnect it takes this branch, `postTool`
+  // throws, and `getSessionSnapshotIfRunning` degrades to no page. That
+  // degradation is intentional - rendering a snapshot resolved in a reissued
+  // id space is exactly the silent retarget this branch exists to prevent.
+  if (pageIdentityChanged && typeof payload.args.pageId === "number") {
+    writeJson(res, 200, { error: PAGE_IDENTITY_CHANGED_ERROR });
+    return;
+  }
   if (isToolResultError(result)) {
     // Surface the tool's own failure text as an error so the CLI throws and
     // exits non-zero instead of printing success (issue #96).
@@ -399,6 +491,7 @@ export async function handleBridgeRequest(
   res: ServerResponse,
   sessionName?: string,
   logForbidden?: (message: string) => void,
+  onPageIdentityChanged?: () => void,
 ): Promise<void> {
   res.setHeader("Content-Type", "application/json");
 
@@ -418,38 +511,39 @@ export async function handleBridgeRequest(
     return;
   }
 
-  if (
-    req.method === "GET" &&
-    (req.url === "/health" || req.url?.startsWith("/health?"))
-  ) {
-    if (!(await isBridgeClientConnected(client))) {
-      writeJson(res, 503, { status: "error", error: "Not connected" });
-      return;
-    }
-    const deep = req.url.includes("deep=1");
-    if (deep) {
-      const probe = await isBridgeTargetReachable(client);
-      if (!probe.ok) {
-        writeJson(res, 503, {
-          status: "error",
-          error: "CDP target unreachable",
-          reason: probe.reason,
-        });
+  try {
+    if (
+      req.method === "GET" &&
+      (req.url === "/health" || req.url?.startsWith("/health?"))
+    ) {
+      if (!(await isBridgeClientConnected(client))) {
+        writeJson(res, 503, { status: "error", error: "Not connected" });
         return;
       }
+      const deep = req.url.includes("deep=1");
+      if (deep) {
+        const probe = await isBridgeTargetReachable(client);
+        if (!probe.ok) {
+          writeJson(res, 503, {
+            status: "error",
+            error: "CDP target unreachable",
+            reason: probe.reason,
+          });
+          return;
+        }
+        if (probe.pageIdentityChanged) onPageIdentityChanged?.();
+      }
+      writeJson(res, 200, { status: "ok", session: sessionName });
+      return;
     }
-    writeJson(res, 200, { status: "ok", session: sessionName });
-    return;
-  }
 
-  try {
     if (req.method === "GET" && req.url === "/tools") {
       await handleToolsRequest(client, res);
       return;
     }
 
     if (req.method === "POST" && req.url === "/call") {
-      await handleCallRequest(client, req, res);
+      await handleCallRequest(client, req, res, onPageIdentityChanged);
       return;
     }
   } catch (error) {
@@ -465,7 +559,14 @@ export function createBridgeServer(
   sessionName?: string,
 ): Server {
   return createServer((req, res) => {
-    void handleBridgeRequest(client, req, res, sessionName, logBridgeMessage);
+    void handleBridgeRequest(
+      client,
+      req,
+      res,
+      sessionName,
+      logBridgeMessage,
+      clearSelectedPageId,
+    );
   });
 }
 
