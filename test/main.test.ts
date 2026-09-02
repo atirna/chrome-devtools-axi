@@ -124,6 +124,20 @@ describe("main", () => {
     },
   );
 
+  it("rejects an unknown flag after fill's allowed --full flag", async () => {
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+
+    await main(["fill", "--full", "--zzzz", "value"]);
+
+    expect(callTool).not.toHaveBeenCalled();
+    expect(String(write.mock.calls[0]?.[0])).toContain(
+      "Unknown flag --zzzz for `fill`",
+    );
+    expect(process.exitCode).toBe(2);
+  });
+
   it.each([
     { argv: ["fill", "@1", "--literal"], tool: "fill" },
     { argv: ["type", "--literal"], tool: "type_text" },

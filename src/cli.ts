@@ -1714,23 +1714,20 @@ function validateCommandFlags(
   command: string,
   args: string[],
   allowedFlags: readonly string[],
-  positionalTextStart = args.length,
+  positionalArgsBeforeText = args.length,
 ): void {
-  const unknownFlag = args
-    .slice(0, positionalTextStart)
-    .find(
-      (arg) =>
-        arg !== "-" &&
-        arg.startsWith("-") &&
-        arg !== "--help" &&
-        !allowedFlags.includes(arg),
-    );
-  if (unknownFlag) {
-    throw new CdpError(
-      `Unknown flag ${unknownFlag} for \`${command}\``,
-      "VALIDATION_ERROR",
-      [`Run \`chrome-devtools-axi ${command} --help\` to see valid flags`],
-    );
+  let positionalArgs = 0;
+  for (const arg of args) {
+    if (positionalArgs === positionalArgsBeforeText) return;
+    if (arg === "--help" || allowedFlags.includes(arg)) continue;
+    if (arg !== "-" && arg.startsWith("-")) {
+      throw new CdpError(
+        `Unknown flag ${arg} for \`${command}\``,
+        "VALIDATION_ERROR",
+        [`Run \`chrome-devtools-axi ${command} --help\` to see valid flags`],
+      );
+    }
+    positionalArgs += 1;
   }
 }
 
