@@ -1714,11 +1714,14 @@ function validateCommandFlags(
   command: string,
   args: string[],
   allowedFlags: readonly string[],
+  positionalTextStart = args.length,
 ): void {
-  const unknownFlag = args.find(
-    (arg) =>
-      arg.startsWith("--") && arg !== "--help" && !allowedFlags.includes(arg),
-  );
+  const unknownFlag = args
+    .slice(0, positionalTextStart)
+    .find(
+      (arg) =>
+        arg.startsWith("--") && arg !== "--help" && !allowedFlags.includes(arg),
+    );
   if (unknownFlag) {
     throw new CdpError(
       `Unknown flag ${unknownFlag} for \`${command}\``,
@@ -1811,11 +1814,22 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
   setup: [],
 };
 
+const COMMAND_POSITIONAL_TEXT_START: Partial<Record<string, number>> = {
+  fill: 1,
+  type: 0,
+  eval: 0,
+};
+
 const COMMANDS: Record<string, CommandFn> = Object.fromEntries(
   Object.entries(COMMAND_HANDLERS).map(([command, handler]) => [
     command,
     (args: string[]) => {
-      validateCommandFlags(command, args, COMMAND_FLAGS[command] ?? []);
+      validateCommandFlags(
+        command,
+        args,
+        COMMAND_FLAGS[command] ?? [],
+        COMMAND_POSITIONAL_TEXT_START[command],
+      );
       return handler(args);
     },
   ]),

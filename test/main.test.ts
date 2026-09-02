@@ -121,6 +121,25 @@ describe("main", () => {
     expect(process.exitCode).toBe(2);
   });
 
+  it.each([
+    { argv: ["fill", "@1", "--literal"], tool: "fill" },
+    { argv: ["type", "--literal"], tool: "type_text" },
+    { argv: ["eval", "--counter"], tool: "evaluate_script" },
+  ])(
+    "keeps positional text beginning with -- for $tool",
+    async ({ argv, tool }) => {
+      const write = vi
+        .spyOn(process.stdout, "write")
+        .mockImplementation(() => true);
+      callTool.mockResolvedValue("");
+
+      await main(argv);
+
+      expect(callTool.mock.calls[0]?.[0]).toBe(tool);
+      expect(process.exitCode).toBeUndefined();
+    },
+  );
+
   it("keeps command-specific flags available", async () => {
     const write = vi
       .spyOn(process.stdout, "write")
