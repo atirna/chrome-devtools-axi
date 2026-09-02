@@ -1710,7 +1710,25 @@ function withoutFullFlag(
   return (args) => handler(splitFullFlag(args).args);
 }
 
-const COMMANDS: Record<string, CommandFn> = {
+function validateCommandFlags(
+  command: string,
+  args: string[],
+  allowedFlags: readonly string[],
+): void {
+  const unknownFlag = args.find(
+    (arg) =>
+      arg.startsWith("--") && arg !== "--help" && !allowedFlags.includes(arg),
+  );
+  if (unknownFlag) {
+    throw new CdpError(
+      `Unknown flag ${unknownFlag} for \`${command}\``,
+      "VALIDATION_ERROR",
+      [`Run \`chrome-devtools-axi ${command} --help\` to see valid flags`],
+    );
+  }
+}
+
+const COMMAND_HANDLERS: Record<string, CommandFn> = {
   open: withFullFlag(handleOpen),
   snapshot: async (args) => handleSnapshot(splitFullFlag(args).full),
   screenshot: withoutFullFlag(handleScreenshot),
@@ -1747,6 +1765,61 @@ const COMMANDS: Record<string, CommandFn> = {
   stop: async () => handleStop(),
   setup: withoutFullFlag(handleSetup),
 };
+
+const COMMAND_FLAGS: Record<string, readonly string[]> = {
+  open: ["--full"],
+  screenshot: ["--uid", "--full-page", "--format"],
+  snapshot: ["--full"],
+  click: ["--full"],
+  fill: ["--full"],
+  type: ["--full"],
+  press: ["--full"],
+  scroll: ["--full"],
+  back: ["--full"],
+  wait: [],
+  eval: ["--full"],
+  run: [],
+  hover: ["--full"],
+  drag: ["--full"],
+  fillform: ["--full"],
+  dialog: [],
+  upload: ["--full"],
+  pages: [],
+  newpage: ["--background", "--full"],
+  selectpage: ["--full"],
+  closepage: [],
+  resize: [],
+  emulate: [
+    "--viewport",
+    "--color-scheme",
+    "--network",
+    "--cpu",
+    "--geolocation",
+    "--user-agent",
+  ],
+  console: ["--type", "--limit", "--page"],
+  "console-get": [],
+  network: ["--type", "--limit", "--page"],
+  "network-get": ["--response-file", "--request-file"],
+  lighthouse: ["--device", "--mode", "--output-dir"],
+  "perf-start": ["--no-reload", "--no-auto-stop", "--file"],
+  "perf-stop": ["--file"],
+  "perf-insight": [],
+  heap: [],
+  start: [],
+  stop: [],
+  setup: [],
+};
+
+const COMMANDS: Record<string, CommandFn> = Object.fromEntries(
+  Object.entries(COMMAND_HANDLERS).map(([command, handler]) => [
+    command,
+    (args: string[]) => {
+      validateCommandFlags(command, args, COMMAND_FLAGS[command] ?? []);
+      return handler(args);
+    },
+  ]),
+);
 
 export async function main(
   options: MainOptions | string[] = {},

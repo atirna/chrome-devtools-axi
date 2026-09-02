@@ -107,6 +107,35 @@ describe("main", () => {
     expect(process.exitCode).toBe(2);
   });
 
+  it("rejects unknown command flags before calling MCP", async () => {
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+
+    await main(["pages", "--zzzz", "nonsense"]);
+
+    expect(callTool).not.toHaveBeenCalled();
+    expect(String(write.mock.calls[0]?.[0])).toContain(
+      "Unknown flag --zzzz for `pages`",
+    );
+    expect(process.exitCode).toBe(2);
+  });
+
+  it("keeps command-specific flags available", async () => {
+    const write = vi
+      .spyOn(process.stdout, "write")
+      .mockImplementation(() => true);
+    callTool.mockResolvedValueOnce("");
+
+    await main(["screenshot", "./shot.png", "--full-page"]);
+
+    expect(callTool).toHaveBeenCalledWith("take_screenshot", {
+      filePath: resolve(process.cwd(), "./shot.png"),
+      fullPage: true,
+    });
+    expect(process.exitCode).toBeUndefined();
+  });
+
   it("recovers open by creating a page when the browser is not yet connected", async () => {
     const write = vi
       .spyOn(process.stdout, "write")
