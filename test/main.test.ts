@@ -107,24 +107,29 @@ describe("main", () => {
     expect(process.exitCode).toBe(2);
   });
 
-  it("rejects unknown command flags before calling MCP", async () => {
-    const write = vi
-      .spyOn(process.stdout, "write")
-      .mockImplementation(() => true);
+  it.each(["--zzzz", "-zzzz"])(
+    "rejects unknown command flag %s before calling MCP",
+    async (flag) => {
+      const write = vi
+        .spyOn(process.stdout, "write")
+        .mockImplementation(() => true);
 
-    await main(["pages", "--zzzz", "nonsense"]);
+      await main(["pages", flag, "nonsense"]);
 
-    expect(callTool).not.toHaveBeenCalled();
-    expect(String(write.mock.calls[0]?.[0])).toContain(
-      "Unknown flag --zzzz for `pages`",
-    );
-    expect(process.exitCode).toBe(2);
-  });
+      expect(callTool).not.toHaveBeenCalled();
+      expect(String(write.mock.calls[0]?.[0])).toContain(
+        `Unknown flag ${flag} for \`pages\``,
+      );
+      expect(process.exitCode).toBe(2);
+    },
+  );
 
   it.each([
     { argv: ["fill", "@1", "--literal"], tool: "fill" },
     { argv: ["type", "--literal"], tool: "type_text" },
+    { argv: ["wait", "--ready"], tool: "wait_for" },
     { argv: ["eval", "--counter"], tool: "evaluate_script" },
+    { argv: ["dialog", "accept", "--ready"], tool: "handle_dialog" },
   ])(
     "keeps positional text beginning with -- for $tool",
     async ({ argv, tool }) => {

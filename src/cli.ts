@@ -1720,7 +1720,10 @@ function validateCommandFlags(
     .slice(0, positionalTextStart)
     .find(
       (arg) =>
-        arg.startsWith("--") && arg !== "--help" && !allowedFlags.includes(arg),
+        arg !== "-" &&
+        arg.startsWith("-") &&
+        arg !== "--help" &&
+        !allowedFlags.includes(arg),
     );
   if (unknownFlag) {
     throw new CdpError(
@@ -1817,7 +1820,9 @@ const COMMAND_FLAGS: Record<string, readonly string[]> = {
 const COMMAND_POSITIONAL_TEXT_START: Partial<Record<string, number>> = {
   fill: 1,
   type: 0,
+  wait: 0,
   eval: 0,
+  dialog: 1,
 };
 
 const COMMANDS: Record<string, CommandFn> = Object.fromEntries(
